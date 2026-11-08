@@ -1,3 +1,4 @@
+pub mod assemble;
 pub mod crd;
 pub mod render;
 pub mod schema;
