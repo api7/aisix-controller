@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: lint
+        run: make lint
+      - name: generated code and CRDs are current
+        run: make crds-check
+      - name: unit and envtest
+        run: make test
+      - name: unit tests against the aisix binary
+        run: make test-aisix
+
+  e2e:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - uses: azure/setup-helm@v4
+      - name: e2e
+        run: test/e2e/run.sh
+        env:
+          # The chart download falls back to `gh release download`.
+          GH_TOKEN: ${{ github.token }}
