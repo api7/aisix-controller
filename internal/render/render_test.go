@@ -192,3 +192,27 @@ func TestReferencesToTheResourcesSecretAreRefused(t *testing.T) {
 		t.Errorf("unrelated reference refused: %s", out["APIKey/fine"].Err)
 	}
 }
+
+func TestModelCannotReferenceALosingProviderKey(t *testing.T) {
+	prod := src(v1alpha1.KindProviderKey, "openai-prod", map[string]any{
+		v1alpha1.IdentityField: "openai", v1alpha1.APIKeySecretRef: ref("creds", "openai"),
+	})
+	test := src(v1alpha1.KindProviderKey, "openai-test", map[string]any{
+		v1alpha1.IdentityField: "openai", v1alpha1.APIKeySecretRef: ref("creds", "caller"),
+	})
+	test.Created = t0.Add(time.Minute)
+	out := byKey(All([]Source{
+		test, prod,
+		src(v1alpha1.KindModel, "cheap", map[string]any{v1alpha1.ProviderKeyRef: map[string]any{"name": "openai-test"}}),
+		src(v1alpha1.KindModel, "main", map[string]any{v1alpha1.ProviderKeyRef: map[string]any{"name": "openai-prod"}}),
+	}, testSecrets(), ""))
+
+	cheap := out["Model/cheap"]
+	if cheap.Entry != nil || !strings.Contains(cheap.Err, `ProviderKey "openai-test", which is not served`) ||
+		!strings.Contains(cheap.Err, "ProviderKey/openai-prod") {
+		t.Errorf("cheap: entry=%v err=%q", cheap.Entry, cheap.Err)
+	}
+	if m := out["Model/main"]; m.Err != "" || m.Entry["provider_key"] != "openai" {
+		t.Errorf("main: entry=%v err=%q", m.Entry, m.Err)
+	}
+}

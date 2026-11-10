@@ -81,27 +81,35 @@ func sortSources(sources []Source) []Source {
 func All(sources []Source, secrets Secrets, reserved string) []Rendered {
 	ordered := sortSources(sources)
 
-	providerIdentities := map[string]string{}
-	for _, s := range ordered {
-		if s.Kind == v1alpha1.KindProviderKey {
-			providerIdentities[s.Name] = s.Identity()
-		}
-	}
-
 	type identity struct {
 		kind v1alpha1.Kind
 		id   string
 	}
-	seen := map[identity]string{}
+	// The oldest resource wins a shared identity; the rest are not served.
+	owners := map[identity]string{}
+	for _, s := range ordered {
+		id := identity{s.Kind, s.Identity()}
+		if _, taken := owners[id]; !taken {
+			owners[id] = s.Name
+		}
+	}
+	owner := func(s Source) string { return owners[identity{s.Kind, s.Identity()}] }
+
+	// Model references resolve only to ProviderKeys that are served.
+	providers := map[string]providerRef{}
+	for _, s := range ordered {
+		if s.Kind == v1alpha1.KindProviderKey {
+			providers[s.Name] = providerRef{identity: s.Identity(), owner: owner(s)}
+		}
+	}
+
 	out := make([]Rendered, 0, len(ordered))
 	for _, s := range ordered {
 		r := Rendered{Source: s}
-		id := identity{s.Kind, s.Identity()}
-		if owner, dup := seen[id]; dup {
-			r.Err = fmt.Sprintf("%s %q is already used by %s/%s", v1alpha1.IdentityField, s.Identity(), s.Kind, owner)
+		if o := owner(s); o != s.Name {
+			r.Err = fmt.Sprintf("%s %q is already used by %s/%s", v1alpha1.IdentityField, s.Identity(), s.Kind, o)
 		} else {
-			seen[id] = s.Name
-			entry, err := one(s, secrets, reserved, providerIdentities)
+			entry, err := one(s, secrets, reserved, providers)
 			if err != nil {
 				r.Err = err.Error()
 			} else {
@@ -113,7 +121,14 @@ func All(sources []Source, secrets Secrets, reserved string) []Rendered {
 	return out
 }
 
-func one(s Source, secrets Secrets, reserved string, providerIdentities map[string]string) (Entry, error) {
+// providerRef is what a Model's provider_key_ref resolves through.
+type providerRef struct {
+	identity string
+	// owner is the ProviderKey that holds the identity in the file.
+	owner string
+}
+
+func one(s Source, secrets Secrets, reserved string, providers map[string]providerRef) (Entry, error) {
 	fields := make(Entry, len(s.Fields)+1)
 	for k, v := range s.Fields {
 		fields[k] = v
@@ -148,11 +163,15 @@ func one(s Source, secrets Secrets, reserved string, providerIdentities map[stri
 			if name == "" {
 				return nil, fmt.Errorf("%s.name is required", v1alpha1.ProviderKeyRef)
 			}
-			identity, ok := providerIdentities[name]
+			p, ok := providers[name]
 			if !ok {
 				return nil, fmt.Errorf("%s names ProviderKey %q, which does not exist", v1alpha1.ProviderKeyRef, name)
 			}
-			fields["provider_key"] = identity
+			if p.owner != name {
+				return nil, fmt.Errorf("%s names ProviderKey %q, which is not served: %s %q is already used by ProviderKey/%s",
+					v1alpha1.ProviderKeyRef, name, v1alpha1.IdentityField, p.identity, p.owner)
+			}
+			fields["provider_key"] = p.identity
 		}
 	case v1alpha1.KindAPIKey:
 		if _, ok := fields["key_hash"]; ok {
