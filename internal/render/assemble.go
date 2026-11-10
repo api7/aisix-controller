@@ -36,7 +36,12 @@ const (
 // Outcome of assembling one document.
 type Outcome struct {
 	// Document to serve; nil when no valid one could be made.
-	Document     []byte
+	Document []byte
+	// Index records which resource owns each entry of Document, keyed
+	// "Kind/name", valued with the entry's identity. It is stored next to
+	// the document so a resource's served entry is found even after its
+	// display_name changes.
+	Index        []byte
 	Dispositions map[Key]Disposition
 	// Error is set when the document as a whole failed.
 	Error string
@@ -65,6 +70,19 @@ func Document(entries map[v1alpha1.Kind][]Entry) []byte {
 	return buf.Bytes()
 }
 
+// Index renders a resource-to-identity index. encoding/json sorts keys, so
+// equal inputs give equal bytes.
+func Index(owners map[string]string) []byte {
+	if owners == nil {
+		owners = map[string]string{}
+	}
+	b, err := json.Marshal(owners)
+	if err != nil {
+		panic(fmt.Sprintf("resources index does not encode: %v", err))
+	}
+	return append(b, '\n')
+}
+
 // Hash is what the gateway reports as applied.config_hash in file mode:
 // SHA-256 of the raw file bytes, lowercase hex.
 func Hash(document []byte) string {
@@ -77,20 +95,27 @@ type servedKey struct {
 	identity string
 }
 
-// Served indexes the entries of the currently served document.
-type Served map[servedKey]Entry
+// Served is the currently served document, indexed by owning resource.
+type Served struct {
+	entries map[servedKey]Entry
+	owners  map[Key]string
+}
 
-// ServedEntries parses a served document. Anything unreadable counts as
-// nothing served.
-func ServedEntries(document []byte) Served {
-	out := Served{}
-	if len(document) == 0 {
+// ServedEntries parses a served document and its index. Anything unreadable
+// counts as nothing served.
+func ServedEntries(document, index []byte) Served {
+	out := Served{entries: map[servedKey]Entry{}, owners: map[Key]string{}}
+	if len(document) == 0 || len(index) == 0 {
 		return out
 	}
 	dec := json.NewDecoder(bytes.NewReader(document))
 	dec.UseNumber()
 	var root map[string]any
 	if err := dec.Decode(&root); err != nil {
+		return out
+	}
+	var owners map[string]string
+	if err := json.Unmarshal(index, &owners); err != nil {
 		return out
 	}
 	for _, k := range v1alpha1.Kinds {
@@ -101,16 +126,28 @@ func ServedEntries(document []byte) Served {
 				continue
 			}
 			if id, ok := e[v1alpha1.IdentityField].(string); ok {
-				out[servedKey{k, strings.ReplaceAll(id, "$$", "$")}] = e
+				out.entries[servedKey{k, strings.ReplaceAll(id, "$$", "$")}] = e
 			}
 		}
+	}
+	for key, id := range owners {
+		kind, name, ok := strings.Cut(key, "/")
+		if !ok {
+			continue
+		}
+		out.owners[Key{v1alpha1.Kind(kind), name}] = id
 	}
 	return out
 }
 
-func (s Served) get(src Source) (Entry, bool) {
-	e, ok := s[servedKey{src.Kind, src.Identity()}]
-	return e, ok
+// get returns the entry a resource is served with, and its identity.
+func (s Served) get(src Source) (Entry, string, bool) {
+	id, ok := s.owners[src.Key()]
+	if !ok {
+		return nil, "", false
+	}
+	e, ok := s.entries[servedKey{src.Kind, id}]
+	return e, id, ok
 }
 
 // ParseScope maps `models[2] ("gpt")` to (Model, 2).
@@ -138,7 +175,9 @@ type item struct {
 	source Source
 	state  State
 	entry  Entry
-	reason string
+	// identity the entry is served under.
+	identity string
+	reason   string
 }
 
 // Assemble builds the document to serve. An entry the gateway rejects is
@@ -147,14 +186,14 @@ type item struct {
 func Assemble(ctx context.Context, rendered []Rendered, served Served, v validate.Validator) (Outcome, error) {
 	items := make([]*item, len(rendered))
 	fallback := func(it *item, reason string) {
-		if e, ok := served.get(it.source); ok {
-			it.state, it.entry, it.reason = Retained, e, reason
+		if e, id, ok := served.get(it.source); ok {
+			it.state, it.entry, it.identity, it.reason = Retained, e, id, reason
 		} else {
-			it.state, it.entry, it.reason = Rejected, nil, reason
+			it.state, it.entry, it.identity, it.reason = Rejected, nil, "", reason
 		}
 	}
 	for i, r := range rendered {
-		it := &item{source: r.Source, state: Applied, entry: r.Entry}
+		it := &item{source: r.Source, state: Applied, entry: r.Entry, identity: r.Source.Identity()}
 		if r.Err != "" {
 			fallback(it, r.Err)
 		}
@@ -205,7 +244,7 @@ func Assemble(ctx context.Context, rendered []Rendered, served Served, v validat
 			case Applied:
 				fallback(it, reason)
 			case Retained:
-				it.state, it.entry = Rejected, nil
+				it.state, it.entry, it.identity = Rejected, nil, ""
 				it.reason = it.reason + "; the previously served version is no longer valid either: " + reason
 			}
 		}
@@ -215,8 +254,15 @@ func Assemble(ctx context.Context, rendered []Rendered, served Served, v validat
 
 func finish(items []*item, doc []byte, errMsg string) Outcome {
 	out := Outcome{Document: doc, Dispositions: map[Key]Disposition{}, Error: errMsg}
+	owners := map[string]string{}
 	for _, it := range items {
 		out.Dispositions[it.source.Key()] = Disposition{State: it.state, Reason: it.reason}
+		if it.state != Rejected {
+			owners[it.source.Key().String()] = it.identity
+		}
+	}
+	if doc != nil {
+		out.Index = Index(owners)
 	}
 	return out
 }

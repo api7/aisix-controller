@@ -93,9 +93,14 @@ func apiKey() Source {
 	})
 }
 
-func assemble(t *testing.T, v validate.Validator, sources []Source, served []byte) Outcome {
+// assemble builds a document, given what the previous outcome serves.
+func assemble(t *testing.T, v validate.Validator, sources []Source, prev *Outcome) Outcome {
 	t.Helper()
-	out, err := Assemble(context.Background(), All(sources, testSecrets(), ""), ServedEntries(served), v)
+	served := ServedEntries(nil, nil)
+	if prev != nil {
+		served = ServedEntries(prev.Document, prev.Index)
+	}
+	out, err := Assemble(context.Background(), All(sources, testSecrets(), ""), served, v)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +173,7 @@ func TestRejectedUpdateKeepsTheServedVersion(t *testing.T) {
 	edited := model("chat", "mock")
 	edited.Fields["no_such_field"] = 1
 	edited.Fields["model_name"] = "new"
-	out := assemble(t, v, []Source{provider(), edited}, first.Document)
+	out := assemble(t, v, []Source{provider(), edited}, &first)
 	if d := disposition(out, v1alpha1.KindModel, "chat"); d.State != Retained {
 		t.Fatalf("chat: %+v", d)
 	}
@@ -208,7 +213,7 @@ func TestCrossFieldRulesDroppedFromTheCRDAreStillEnforced(t *testing.T) {
 func TestDeletedResourcesLeaveTheDocument(t *testing.T) {
 	v := gatewayValidator(t, &fakeValidator{})
 	first := assemble(t, v, []Source{provider(), model("chat", "mock"), apiKey()}, nil)
-	out := assemble(t, v, []Source{provider(), model("chat", "mock")}, first.Document)
+	out := assemble(t, v, []Source{provider(), model("chat", "mock")}, &first)
 	if bytes.Contains(out.Document, []byte("api_keys")) {
 		t.Errorf("deleted APIKey still served:\n%s", out.Document)
 	}
@@ -248,13 +253,62 @@ func TestScopesParse(t *testing.T) {
 	}
 }
 
-func TestServedIdentitiesAreUnescaped(t *testing.T) {
-	doc := Document(map[v1alpha1.Kind][]Entry{v1alpha1.KindModel: {{v1alpha1.IdentityField: "a$$b"}}})
-	served := ServedEntries(doc)
-	if _, ok := served.get(src(v1alpha1.KindModel, "x", map[string]any{v1alpha1.IdentityField: "a$b"})); !ok {
-		t.Error("served entry not found by its literal identity")
+func rejectUnknownField(_ v1alpha1.Kind, e Entry) string {
+	if _, ok := e["no_such_field"]; ok {
+		return "unknown field `no_such_field`"
 	}
-	if len(ServedEntries([]byte("not: json"))) != 0 {
-		t.Error("unreadable document should count as nothing served")
+	return ""
+}
+
+func TestRenamedAndRejectedKeepsTheServedEntry(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{reject: rejectUnknownField})
+	first := assemble(t, v, []Source{provider(), model("chat", "mock")}, nil)
+	if string(first.Index) != `{"Model/chat":"chat","ProviderKey/mock":"mock"}`+"\n" {
+		t.Fatalf("index = %s", first.Index)
+	}
+	edited := model("chat", "mock")
+	edited.Fields[v1alpha1.IdentityField] = "renamed"
+	edited.Fields["no_such_field"] = 1
+	out := assemble(t, v, []Source{provider(), edited}, &first)
+	if d := disposition(out, v1alpha1.KindModel, "chat"); d.State != Retained {
+		t.Fatalf("chat: %+v", d)
+	}
+	if !bytes.Equal(out.Document, first.Document) || !bytes.Equal(out.Index, first.Index) {
+		t.Errorf("served state changed:\n%s\n%s", out.Document, out.Index)
+	}
+}
+
+func TestServedEntriesBelongToTheirResource(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{reject: rejectUnknownField})
+	old := model("old", "mock")
+	old.Fields[v1alpha1.IdentityField] = "shared"
+	first := assemble(t, v, []Source{provider(), old}, nil)
+
+	// A new resource under the same identity must not inherit old's entry.
+	newer := model("new", "mock")
+	newer.Fields[v1alpha1.IdentityField] = "shared"
+	newer.Fields["no_such_field"] = 1
+	out := assemble(t, v, []Source{provider(), newer}, &first)
+	if d := disposition(out, v1alpha1.KindModel, "new"); d.State != Rejected {
+		t.Errorf("new: %+v", d)
+	}
+	if bytes.Contains(out.Document, []byte(`"shared"`)) {
+		t.Errorf("the deleted resource's entry is still served:\n%s", out.Document)
+	}
+}
+
+func TestServedEntriesParse(t *testing.T) {
+	doc := Document(map[v1alpha1.Kind][]Entry{v1alpha1.KindModel: {{v1alpha1.IdentityField: "a$$b"}}})
+	served := ServedEntries(doc, Index(map[string]string{"Model/x": "a$b"}))
+	if _, id, ok := served.get(src(v1alpha1.KindModel, "x", map[string]any{v1alpha1.IdentityField: "renamed"})); !ok || id != "a$b" {
+		t.Errorf("served entry not found through the index: %q %v", id, ok)
+	}
+	if _, _, ok := served.get(src(v1alpha1.KindModel, "y", map[string]any{v1alpha1.IdentityField: "a$b"})); ok {
+		t.Error("an unindexed resource found an entry by identity")
+	}
+	for _, bad := range [][2][]byte{{[]byte("not: json"), Index(nil)}, {doc, []byte("nope")}, {doc, nil}} {
+		if _, _, ok := ServedEntries(bad[0], bad[1]).get(src(v1alpha1.KindModel, "x", nil)); ok {
+			t.Errorf("unreadable input counted as served: %q %q", bad[0], bad[1])
+		}
 	}
 }

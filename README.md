@@ -18,7 +18,7 @@ aisix-controller ── render ── aisix validate (bundled binary) ──► 
 
 1. Every change to a custom resource, a referenced Secret, the gateway Deployment or its pods re-renders the whole resources file (`_format_version: "1"`).
 2. The document is checked with `aisix validate` from the same aisix release, run with an empty environment. A resource the gateway would reject keeps its previously served entry, or is left out if it was never served. The Secret never holds a file the gateway cannot load, which matters because a gateway pod with an invalid file fails to start.
-3. A changed document is written to the `aisix-resources` Secret, and its SHA-256 is stamped on the gateway Deployment's pod template. The gateway reads its resources file at boot and on SIGHUP only, so the stamp rolls the pods.
+3. A changed document is written to the `aisix-resources` Secret, next to `aisix-controller.index.json`, which records the resource each entry belongs to so a resource's served entry is found even after its `display_name` changes. The document's SHA-256 is stamped on the gateway Deployment's pod template. The gateway reads its resources file at boot and on SIGHUP only, so the stamp rolls the pods.
 4. `Programmed` turns true once every ready gateway pod reports the written file's hash as `applied.config_hash` on its status listener.
 
 ## Resources
@@ -30,6 +30,8 @@ All kinds are namespaced, in `aisix.api7.ai/v1alpha1`. A `spec` is the AISIX res
 | `ProviderKey` | `aipk` | `api_key_secret_ref: {name, key}`: the upstream credential |
 | `Model` | `aimodel` | `provider_key_ref: {name}`: a ProviderKey's `metadata.name` (direct models only) |
 | `APIKey` | `aikey` | `key_secret_ref: {name, key}`: the caller's plaintext key; only its SHA-256 is written |
+
+Secret refs may name any Secret in the namespace except the controller's own `aisix-resources`. A `provider_key_ref` must name a ProviderKey that is served; one that lost a shared `display_name` to an older ProviderKey is rejected.
 
 ```yaml
 apiVersion: aisix.api7.ai/v1alpha1

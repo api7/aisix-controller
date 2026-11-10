@@ -33,6 +33,10 @@ import (
 // FieldManager names the controller in managed fields and labels.
 const FieldManager = "aisix-controller"
 
+// IndexKey holds, next to the resources file, which resource owns each of
+// its entries. The gateway reads only the resources file.
+const IndexKey = "aisix-controller.index.json"
+
 // Reconciler writes the resources file of one gateway.
 type Reconciler struct {
 	Client     client.Client
@@ -93,7 +97,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 	}
 
 	secretData := render.Secrets{}
-	var current []byte
+	var current, currentIndex []byte
 	var target *corev1.Secret
 	for i := range secrets.Items {
 		s := &secrets.Items[i]
@@ -101,6 +105,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 			// The generated file is never a credential source.
 			target = s
 			current = s.Data[r.SecretKey]
+			currentIndex = s.Data[IndexKey]
 			continue
 		}
 		secretData[s.Name] = s.Data
@@ -112,7 +117,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 			rendered[i].Entry, rendered[i].Err = nil, msg
 		}
 	}
-	outcome, err := render.Assemble(ctx, rendered, render.ServedEntries(current), r.Validator)
+	outcome, err := render.Assemble(ctx, rendered, render.ServedEntries(current, currentIndex), r.Validator)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -121,13 +126,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 	}
 
 	// A gateway needs a file to start, so seed an empty one.
-	desired := outcome.Document
+	desired, desiredIndex := outcome.Document, outcome.Index
 	if desired == nil && target == nil {
-		desired = render.Document(nil)
+		desired, desiredIndex = render.Document(nil), render.Index(nil)
 	}
 	served := current
-	if desired != nil && (target == nil || !bytes.Equal(current, desired)) {
-		if err := r.writeSecret(ctx, target, desired); err != nil {
+	if desired != nil && (target == nil || !bytes.Equal(current, desired) || !bytes.Equal(currentIndex, desiredIndex)) {
+		if err := r.writeSecret(ctx, target, desired, desiredIndex); err != nil {
 			return ctrl.Result{}, err
 		}
 		logger.Info("resources file written", "hash", render.Hash(desired)[:12])
@@ -160,7 +165,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 	return ctrl.Result{RequeueAfter: r.Resync}, nil
 }
 
-func (r *Reconciler) writeSecret(ctx context.Context, existing *corev1.Secret, doc []byte) error {
+func (r *Reconciler) writeSecret(ctx context.Context, existing *corev1.Secret, doc, index []byte) error {
 	labels := map[string]string{"app.kubernetes.io/managed-by": FieldManager}
 	annotations := map[string]string{v1alpha1.HashAnnotation: render.Hash(doc)}
 	if existing == nil {
@@ -169,7 +174,7 @@ func (r *Reconciler) writeSecret(ctx context.Context, existing *corev1.Secret, d
 				Name: r.Secret, Namespace: r.Namespace, Labels: labels, Annotations: annotations,
 			},
 			Type: corev1.SecretTypeOpaque,
-			Data: map[string][]byte{r.SecretKey: doc},
+			Data: map[string][]byte{r.SecretKey: doc, IndexKey: index},
 		}
 		if err := r.Client.Create(ctx, s, client.FieldOwner(FieldManager)); err != nil {
 			return fmt.Errorf("creating Secret %s: %w", r.Secret, err)
@@ -193,6 +198,7 @@ func (r *Reconciler) writeSecret(ctx context.Context, existing *corev1.Secret, d
 		s.Data = map[string][]byte{}
 	}
 	s.Data[r.SecretKey] = doc
+	s.Data[IndexKey] = index
 	if err := r.Client.Update(ctx, s, client.FieldOwner(FieldManager)); err != nil {
 		return fmt.Errorf("updating Secret %s: %w", r.Secret, err)
 	}

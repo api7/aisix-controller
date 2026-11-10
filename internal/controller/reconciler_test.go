@@ -290,11 +290,21 @@ func TestReconcileServesResourcesAndReportsStatus(t *testing.T) {
 		t.Errorf("settled state should resync, got %v", res.RequeueAfter)
 	}
 
-	// A change the gateway rejects keeps the served version.
+	// The index records which resource owns each served entry.
+	var sec corev1.Secret
+	if err := testClient.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "aisix-resources"}, &sec); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(sec.Data[IndexKey]); !strings.Contains(got, `"Model/chat":"e2e/chat"`) {
+		t.Errorf("index = %s", got)
+	}
+
+	// A change the gateway rejects keeps the served version, even when the
+	// same edit renames the resource.
 	if err := testClient.Get(context.Background(), client.ObjectKeyFromObject(model), model); err != nil {
 		t.Fatal(err)
 	}
-	model.Spec = spec(t, map[string]any{"display_name": "e2e/chat", "provider": "openai", "model_name": "reject-me",
+	model.Spec = spec(t, map[string]any{"display_name": "renamed", "provider": "openai", "model_name": "reject-me",
 		v1alpha1.ProviderKeyRef: map[string]any{"name": "mock"}})
 	if err := testClient.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
