@@ -1,0 +1,7 @@
+bin
+.git
+test
+config
+third_party
+hack
+*.md
