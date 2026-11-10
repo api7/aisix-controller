@@ -37,7 +37,7 @@ func TestProviderKeyTakesCredentialFromSecretAndEscapesIt(t *testing.T) {
 		"provider":               "openai",
 		"api_base":               "http://x/${not_env}",
 		v1alpha1.APIKeySecretRef: ref("creds", "openai"),
-	})}, testSecrets()))
+	})}, testSecrets(), ""))
 	r := out["ProviderKey/openai"]
 	if r.Err != "" {
 		t.Fatal(r.Err)
@@ -66,7 +66,7 @@ func TestModelReferenceResolvesToProviderIdentity(t *testing.T) {
 			v1alpha1.IdentityField:  "openai/gpt",
 			v1alpha1.ProviderKeyRef: map[string]any{"name": "pk"},
 		}),
-	}, testSecrets()))
+	}, testSecrets(), ""))
 	m := out["Model/m"]
 	if m.Err != "" {
 		t.Fatal(m.Err)
@@ -79,7 +79,7 @@ func TestModelReferenceResolvesToProviderIdentity(t *testing.T) {
 func TestAPIKeyIsHashed(t *testing.T) {
 	out := byKey(All([]Source{src(v1alpha1.KindAPIKey, "k", map[string]any{
 		v1alpha1.KeySecretRef: ref("creds", "caller"),
-	})}, testSecrets()))
+	})}, testSecrets(), ""))
 	k := out["APIKey/k"]
 	if k.Err != "" {
 		t.Fatal(k.Err)
@@ -104,7 +104,7 @@ func TestMissingReferencesAreErrors(t *testing.T) {
 		src(v1alpha1.KindProviderKey, "unset", map[string]any{}),
 		src(v1alpha1.KindModel, "dangling", map[string]any{v1alpha1.ProviderKeyRef: map[string]any{"name": "ghost"}}),
 		src(v1alpha1.KindAPIKey, "keyless", map[string]any{}),
-	}, testSecrets()))
+	}, testSecrets(), ""))
 	want := map[string]string{
 		"ProviderKey/no-secret": `Secret "nope" not found`,
 		"ProviderKey/no-key":    `has no key "nope"`,
@@ -126,7 +126,7 @@ func TestInlineCredentialsAreRefused(t *testing.T) {
 		src(v1alpha1.KindProviderKey, "b", map[string]any{"secret": "x", v1alpha1.APIKeySecretRef: ref("creds", "openai")}),
 		src(v1alpha1.KindModel, "c", map[string]any{"provider_key_id": "x"}),
 		src(v1alpha1.KindAPIKey, "d", map[string]any{"key_hash": "x", v1alpha1.KeySecretRef: ref("creds", "caller")}),
-	}, testSecrets()))
+	}, testSecrets(), ""))
 	for _, k := range []string{"ProviderKey/a", "ProviderKey/b", "Model/c", "APIKey/d"} {
 		if out[k].Err == "" {
 			t.Errorf("%s was accepted", k)
@@ -138,7 +138,7 @@ func TestDuplicateIdentityLosesToOlderResource(t *testing.T) {
 	older := src(v1alpha1.KindModel, "zzz", map[string]any{v1alpha1.IdentityField: "same"})
 	newer := src(v1alpha1.KindModel, "aaa", map[string]any{v1alpha1.IdentityField: "same"})
 	newer.Created = t0.Add(time.Minute)
-	out := byKey(All([]Source{newer, older}, testSecrets()))
+	out := byKey(All([]Source{newer, older}, testSecrets(), ""))
 	if out["Model/zzz"].Err != "" {
 		t.Errorf("older lost: %s", out["Model/zzz"].Err)
 	}
@@ -155,7 +155,7 @@ func TestOrderIsKindThenAgeThenName(t *testing.T) {
 	key := src(v1alpha1.KindAPIKey, "k", map[string]any{})
 	pk := src(v1alpha1.KindProviderKey, "p", map[string]any{})
 	var got []string
-	for _, r := range All([]Source{key, late, b, a, pk}, testSecrets()) {
+	for _, r := range All([]Source{key, late, b, a, pk}, testSecrets(), "") {
 		got = append(got, r.Source.Key().String())
 	}
 	want := "ProviderKey/p Model/a Model/b Model/0 APIKey/k"
@@ -172,5 +172,23 @@ func TestEscapeDollarsReachesEveryString(t *testing.T) {
 	}
 	if in["a"] != "$" {
 		t.Error("input was mutated")
+	}
+}
+
+func TestReferencesToTheResourcesSecretAreRefused(t *testing.T) {
+	secrets := testSecrets()
+	secrets["aisix-resources"] = map[string][]byte{"resources.yaml": []byte(`{"_format_version": "1"}`)}
+	out := byKey(All([]Source{
+		src(v1alpha1.KindAPIKey, "loop", map[string]any{v1alpha1.KeySecretRef: ref("aisix-resources", "resources.yaml")}),
+		src(v1alpha1.KindProviderKey, "grow", map[string]any{v1alpha1.APIKeySecretRef: ref("aisix-resources", "other")}),
+		src(v1alpha1.KindAPIKey, "fine", map[string]any{v1alpha1.KeySecretRef: ref("creds", "caller")}),
+	}, secrets, "aisix-resources"))
+	for _, k := range []string{"APIKey/loop", "ProviderKey/grow"} {
+		if !strings.Contains(out[k].Err, "holds the generated resources file") {
+			t.Errorf("%s: err = %q", k, out[k].Err)
+		}
+	}
+	if out["APIKey/fine"].Err != "" {
+		t.Errorf("unrelated reference refused: %s", out["APIKey/fine"].Err)
 	}
 }

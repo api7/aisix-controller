@@ -321,6 +321,40 @@ func TestReconcileServesResourcesAndReportsStatus(t *testing.T) {
 	}
 }
 
+func TestSelfReferenceDoesNotFeedBack(t *testing.T) {
+	needEnv(t)
+	ns := newNamespace(t)
+	r := newReconciler(ns, &fakeStatus{hashes: map[string]string{}})
+	reconcileOnce(t, r)
+
+	loop := &v1alpha1.APIKey{
+		ObjectMeta: metav1.ObjectMeta{Name: "loop", Namespace: ns},
+		Spec: spec(t, map[string]any{"allowed_models": []any{"*"},
+			v1alpha1.KeySecretRef: map[string]any{"name": "aisix-resources", "key": "resources.yaml"}}),
+	}
+	create(t, loop)
+	reconcileOnce(t, r)
+	var before corev1.Secret
+	if err := testClient.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "aisix-resources"}, &before); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, r)
+	reconcileOnce(t, r)
+	var after corev1.Secret
+	if err := testClient.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "aisix-resources"}, &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.ResourceVersion != before.ResourceVersion {
+		t.Error("the resources Secret keeps changing")
+	}
+	if !bytes.Equal(after.Data["resources.yaml"], render.Document(nil)) {
+		t.Errorf("served = %s", after.Data["resources.yaml"])
+	}
+	if c := conditionOf(t, loop, CondAccepted); c.Status != metav1.ConditionFalse || !strings.Contains(c.Message, "holds the generated resources file") {
+		t.Errorf("Accepted = %+v", c)
+	}
+}
+
 func TestManagerReconcilesOnStartAndOnChange(t *testing.T) {
 	needEnv(t)
 	ns := newNamespace(t)

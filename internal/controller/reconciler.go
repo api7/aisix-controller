@@ -97,14 +97,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 	var target *corev1.Secret
 	for i := range secrets.Items {
 		s := &secrets.Items[i]
-		secretData[s.Name] = s.Data
 		if s.Name == r.Secret {
+			// The generated file is never a credential source.
 			target = s
 			current = s.Data[r.SecretKey]
+			continue
 		}
+		secretData[s.Name] = s.Data
 	}
 
-	rendered := render.All(sources, secretData)
+	rendered := render.All(sources, secretData, r.Secret)
 	for i := range rendered {
 		if msg, ok := decodeErrs[rendered[i].Source.Key()]; ok {
 			rendered[i].Entry, rendered[i].Err = nil, msg

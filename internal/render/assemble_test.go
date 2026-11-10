@@ -95,7 +95,7 @@ func apiKey() Source {
 
 func assemble(t *testing.T, v validate.Validator, sources []Source, served []byte) Outcome {
 	t.Helper()
-	out, err := Assemble(context.Background(), All(sources, testSecrets()), ServedEntries(served), v)
+	out, err := Assemble(context.Background(), All(sources, testSecrets(), ""), ServedEntries(served), v)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestWholeDocumentErrorsAreNotAttributed(t *testing.T) {
 	broken := validate.Func(func(ctx context.Context, doc []byte) ([]validate.LoadError, error) {
 		return []validate.LoadError{{Scope: "(file)", Message: "boom"}}, nil
 	})
-	out, err := Assemble(context.Background(), All([]Source{provider()}, testSecrets()), Served{}, broken)
+	out, err := Assemble(context.Background(), All([]Source{provider()}, testSecrets(), ""), Served{}, broken)
 	if err != nil {
 		t.Fatal(err)
 	}

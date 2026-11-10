@@ -74,8 +74,11 @@ func sortSources(sources []Source) []Source {
 	return out
 }
 
-// All renders every source, in file order.
-func All(sources []Source, secrets Secrets) []Rendered {
+// All renders every source, in file order. reserved names the Secret the
+// resources file is written to; references to it are refused, since
+// reading the generated file back as a credential would feed every write
+// into the next one.
+func All(sources []Source, secrets Secrets, reserved string) []Rendered {
 	ordered := sortSources(sources)
 
 	providerIdentities := map[string]string{}
@@ -98,7 +101,7 @@ func All(sources []Source, secrets Secrets) []Rendered {
 			r.Err = fmt.Sprintf("%s %q is already used by %s/%s", v1alpha1.IdentityField, s.Identity(), s.Kind, owner)
 		} else {
 			seen[id] = s.Name
-			entry, err := one(s, secrets, providerIdentities)
+			entry, err := one(s, secrets, reserved, providerIdentities)
 			if err != nil {
 				r.Err = err.Error()
 			} else {
@@ -110,7 +113,7 @@ func All(sources []Source, secrets Secrets) []Rendered {
 	return out
 }
 
-func one(s Source, secrets Secrets, providerIdentities map[string]string) (Entry, error) {
+func one(s Source, secrets Secrets, reserved string, providerIdentities map[string]string) (Entry, error) {
 	fields := make(Entry, len(s.Fields)+1)
 	for k, v := range s.Fields {
 		fields[k] = v
@@ -129,7 +132,7 @@ func one(s Source, secrets Secrets, providerIdentities map[string]string) (Entry
 			return nil, fmt.Errorf("%s is required", v1alpha1.APIKeySecretRef)
 		}
 		delete(fields, v1alpha1.APIKeySecretRef)
-		value, err := secretValue(ref, secrets, v1alpha1.APIKeySecretRef)
+		value, err := secretValue(ref, secrets, reserved, v1alpha1.APIKeySecretRef)
 		if err != nil {
 			return nil, err
 		}
@@ -160,7 +163,7 @@ func one(s Source, secrets Secrets, providerIdentities map[string]string) (Entry
 			return nil, fmt.Errorf("%s is required", v1alpha1.KeySecretRef)
 		}
 		delete(fields, v1alpha1.KeySecretRef)
-		plaintext, err := secretValue(ref, secrets, v1alpha1.KeySecretRef)
+		plaintext, err := secretValue(ref, secrets, reserved, v1alpha1.KeySecretRef)
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +180,7 @@ func HashKey(plaintext string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func secretValue(ref any, secrets Secrets, field string) (string, error) {
+func secretValue(ref any, secrets Secrets, reserved, field string) (string, error) {
 	m, _ := ref.(map[string]any)
 	name, _ := m["name"].(string)
 	key, _ := m["key"].(string)
@@ -186,6 +189,9 @@ func secretValue(ref any, secrets Secrets, field string) (string, error) {
 	}
 	if key == "" {
 		return "", fmt.Errorf("%s.key is required", field)
+	}
+	if reserved != "" && name == reserved {
+		return "", fmt.Errorf("%s: Secret %q holds the generated resources file and cannot be referenced", field, name)
 	}
 	data, ok := secrets[name]
 	if !ok {
