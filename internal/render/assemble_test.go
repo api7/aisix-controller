@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/api7/aisix-controller/api/v1alpha1"
 	"github.com/api7/aisix-controller/internal/validate"
@@ -311,4 +312,274 @@ func TestServedEntriesParse(t *testing.T) {
 			t.Errorf("unreadable input counted as served: %q %q", bad[0], bad[1])
 		}
 	}
+}
+
+const (
+	credOne = "sk-$$abc"
+	credTwo = "caller-key"
+)
+
+// namedProvider is a ProviderKey; secretKey picks credOne ("openai"),
+// credTwo ("caller"), or a missing key.
+func namedProvider(name, display, secretKey string, age time.Duration) Source {
+	s := src(v1alpha1.KindProviderKey, name, map[string]any{
+		"provider": "openai", "adapter": "openai", "api_base": "http://" + name + ":8080/v1",
+		v1alpha1.IdentityField: display, v1alpha1.APIKeySecretRef: ref("creds", secretKey),
+	})
+	s.Created = t0.Add(age)
+	return s
+}
+
+func invalid(s Source) Source {
+	s.Fields["no_such_field"] = 1
+	return s
+}
+
+func entries(t *testing.T, o Outcome, collection string) map[string]map[string]any {
+	t.Helper()
+	if o.Error != "" || o.Document == nil {
+		t.Fatalf("outcome = %+v", o)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(o.Document, &root); err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]map[string]any{}
+	for _, e := range list(root, collection) {
+		out[e[v1alpha1.IdentityField].(string)] = e
+	}
+	return out
+}
+
+// wantModel checks which provider key a Model is served on, and that the
+// provider key carries the expected credential.
+func wantModel(t *testing.T, o Outcome, model, providerKey, credential string) {
+	t.Helper()
+	m, ok := entries(t, o, "models")[model]
+	if !ok {
+		t.Fatalf("model %s is not served:\n%s", model, o.Document)
+	}
+	if m["provider_key"] != providerKey {
+		t.Errorf("model %s: provider_key = %v, want %s", model, m["provider_key"], providerKey)
+	}
+	p, ok := entries(t, o, "provider_keys")[providerKey]
+	if !ok {
+		t.Fatalf("provider key %s is not served:\n%s", providerKey, o.Document)
+	}
+	if p["api_key"] != credential {
+		t.Errorf("provider key %s: api_key = %v, want %s", providerKey, p["api_key"], credential)
+	}
+}
+
+func wantState(t *testing.T, o Outcome, kind v1alpha1.Kind, name string, state State, reason string) {
+	t.Helper()
+	d := disposition(o, kind, name)
+	if d.State != state || !strings.Contains(d.Reason, reason) {
+		t.Errorf("%s/%s: %+v, want state %d with reason %q", kind, name, d, state, reason)
+	}
+}
+
+func TestFailedRenameKeepsModelsOnTheServedName(t *testing.T) {
+	for label, edited := range map[string]Source{
+		"at render":      namedProvider("p", "B", "typo", 0),
+		"by the gateway": invalid(namedProvider("p", "B", "openai", 0)),
+	} {
+		t.Run(label, func(t *testing.T) {
+			v := gatewayValidator(t, &fakeValidator{reject: rejectUnknownField})
+			first := assemble(t, v, []Source{namedProvider("p", "A", "openai", 0), model("m", "p")}, nil)
+			out := assemble(t, v, []Source{edited, model("m", "p"), model("m2", "p")}, &first)
+			wantState(t, out, v1alpha1.KindProviderKey, "p", Retained, "")
+			wantState(t, out, v1alpha1.KindModel, "m", Applied, "")
+			wantState(t, out, v1alpha1.KindModel, "m2", Applied, "")
+			wantModel(t, out, "m", "A", credOne)
+			wantModel(t, out, "m2", "A", credOne)
+		})
+	}
+}
+
+func TestRenameOntoAServedNameFails(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	second := namedProvider("p2", "B", "caller", time.Hour)
+	first := assemble(t, v, []Source{namedProvider("p1", "A", "openai", 0), second, model("m1", "p1"), model("m2", "p2")}, nil)
+	out := assemble(t, v, []Source{namedProvider("p1", "B", "openai", 0), second, model("m1", "p1"), model("m2", "p2")}, &first)
+	wantState(t, out, v1alpha1.KindProviderKey, "p1", Retained, "already used by ProviderKey/p2")
+	wantState(t, out, v1alpha1.KindProviderKey, "p2", Applied, "")
+	wantState(t, out, v1alpha1.KindModel, "m1", Applied, "")
+	wantState(t, out, v1alpha1.KindModel, "m2", Applied, "")
+	wantModel(t, out, "m1", "A", credOne)
+	wantModel(t, out, "m2", "B", credTwo)
+	if !bytes.Equal(out.Document, first.Document) {
+		t.Errorf("served document changed:\n%s", out.Document)
+	}
+}
+
+func TestRenameOntoARetainedNameFails(t *testing.T) {
+	failures := map[string]func(Source) Source{
+		"at render": func(s Source) Source {
+			s.Fields[v1alpha1.APIKeySecretRef] = ref("creds", "typo")
+			return s
+		},
+		"by the gateway": invalid,
+	}
+	ages := map[string][2]time.Duration{
+		"holder older":   {time.Hour, 0},
+		"claimant older": {0, time.Hour},
+	}
+	for failure, fail := range failures {
+		for age, a := range ages {
+			t.Run(failure+"/"+age, func(t *testing.T) {
+				v := gatewayValidator(t, &fakeValidator{reject: rejectUnknownField})
+				first := assemble(t, v, []Source{
+					namedProvider("p1", "A", "openai", a[0]), namedProvider("p2", "B", "caller", a[1]), model("m1", "p1"),
+				}, nil)
+				out := assemble(t, v, []Source{
+					namedProvider("p1", "B", "openai", a[0]), fail(namedProvider("p2", "C", "caller", a[1])), model("m1", "p1"),
+				}, &first)
+				wantState(t, out, v1alpha1.KindProviderKey, "p2", Retained, "")
+				wantState(t, out, v1alpha1.KindProviderKey, "p1", Retained, "already used by ProviderKey/p2")
+				wantState(t, out, v1alpha1.KindModel, "m1", Applied, "")
+				wantModel(t, out, "m1", "A", credOne)
+				if _, ok := entries(t, out, "provider_keys")["B"]; !ok {
+					t.Errorf("p2's entry is gone:\n%s", out.Document)
+				}
+			})
+		}
+	}
+}
+
+func TestSwappedNamesBothApply(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	first := assemble(t, v, []Source{
+		namedProvider("p1", "A", "openai", 0), namedProvider("p2", "B", "caller", time.Hour), model("m1", "p1"), model("m2", "p2"),
+	}, nil)
+	out := assemble(t, v, []Source{
+		namedProvider("p1", "B", "openai", 0), namedProvider("p2", "A", "caller", time.Hour), model("m1", "p1"), model("m2", "p2"),
+	}, &first)
+	wantState(t, out, v1alpha1.KindProviderKey, "p1", Applied, "")
+	wantState(t, out, v1alpha1.KindProviderKey, "p2", Applied, "")
+	wantModel(t, out, "m1", "B", credOne)
+	wantModel(t, out, "m2", "A", credTwo)
+}
+
+func TestFallingBackReclaimsTheOldName(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	holder := namedProvider("p2", "B", "caller", time.Hour)
+	first := assemble(t, v, []Source{namedProvider("p1", "A", "openai", 0), holder, namedProvider("p3", "X", "caller", 2*time.Hour)}, nil)
+	out := assemble(t, v, []Source{namedProvider("p1", "B", "openai", 0), holder, namedProvider("p3", "A", "caller", 2*time.Hour)}, &first)
+	wantState(t, out, v1alpha1.KindProviderKey, "p1", Retained, "already used by ProviderKey/p2")
+	wantState(t, out, v1alpha1.KindProviderKey, "p3", Retained, "already used by ProviderKey/p1")
+	if !bytes.Equal(out.Document, first.Document) {
+		t.Errorf("served document changed:\n%s", out.Document)
+	}
+}
+
+func TestServedModelKeepsItsNameAgainstAnOlderModel(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	older := model("older", "mock")
+	older.Fields[v1alpha1.IdentityField] = "one"
+	newer := model("newer", "mock")
+	newer.Fields[v1alpha1.IdentityField] = "two"
+	newer.Created = t0.Add(time.Hour)
+	first := assemble(t, v, []Source{provider(), older, newer}, nil)
+
+	renamed := model("older", "mock")
+	renamed.Fields[v1alpha1.IdentityField] = "two"
+	out := assemble(t, v, []Source{provider(), renamed, newer}, &first)
+	wantState(t, out, v1alpha1.KindModel, "older", Retained, "already used by Model/newer")
+	wantState(t, out, v1alpha1.KindModel, "newer", Applied, "")
+}
+
+func TestOldestWinsANameNobodyIsServedUnder(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	older := model("zzz", "mock")
+	older.Fields[v1alpha1.IdentityField] = "same"
+	newer := model("aaa", "mock")
+	newer.Fields[v1alpha1.IdentityField] = "same"
+	newer.Created = t0.Add(time.Minute)
+	out := assemble(t, v, []Source{provider(), newer, older}, nil)
+	wantState(t, out, v1alpha1.KindModel, "zzz", Applied, "")
+	wantState(t, out, v1alpha1.KindModel, "aaa", Rejected, "already used by Model/zzz")
+}
+
+func TestModelCannotReferenceALosingProviderKey(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	out := assemble(t, v, []Source{
+		namedProvider("prod", "openai", "openai", 0), namedProvider("test", "openai", "caller", time.Minute),
+		model("cheap", "test"), model("main", "prod"),
+	}, nil)
+	wantState(t, out, v1alpha1.KindModel, "cheap", Rejected, `ProviderKey "test", which is not served`)
+	wantState(t, out, v1alpha1.KindModel, "cheap", Rejected, "already used by ProviderKey/prod")
+	wantState(t, out, v1alpha1.KindModel, "main", Applied, "")
+	wantModel(t, out, "main", "openai", credOne)
+}
+
+func TestModelResolvesToTheProviderDisplayName(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	m := model("m", "pk")
+	m.Fields[v1alpha1.IdentityField] = "openai/gpt"
+	out := assemble(t, v, []Source{namedProvider("pk", "Provider One", "openai", 0), m}, nil)
+	wantModel(t, out, "openai/gpt", "Provider One", credOne)
+}
+
+func TestModelNamingAMissingProviderKeyIsRejected(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	out := assemble(t, v, []Source{model("dangling", "ghost")}, nil)
+	wantState(t, out, v1alpha1.KindModel, "dangling", Rejected, `ProviderKey "ghost", which does not exist`)
+}
+
+func TestRetainedModelFollowsItsProviderKeyRename(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{reject: rejectUnknownField})
+	first := assemble(t, v, []Source{namedProvider("p", "A", "openai", 0), model("m", "p")}, nil)
+	out := assemble(t, v, []Source{namedProvider("p", "B", "openai", 0), invalid(model("m", "p"))}, &first)
+	wantState(t, out, v1alpha1.KindProviderKey, "p", Applied, "")
+	wantState(t, out, v1alpha1.KindModel, "m", Retained, "no_such_field")
+	wantModel(t, out, "m", "B", credOne)
+}
+
+func TestRetainedModelKeepsItsServedReference(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	first := assemble(t, v, []Source{namedProvider("p", "A", "openai", 0), model("m", "p")}, nil)
+	out := assemble(t, v, []Source{namedProvider("p", "A", "openai", 0), model("m", "ghost")}, &first)
+	wantState(t, out, v1alpha1.KindModel, "m", Retained, `ProviderKey "ghost", which does not exist`)
+	wantModel(t, out, "m", "A", credOne)
+}
+
+func TestModelNeverInheritsAReplacementProviderKey(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	first := assemble(t, v, []Source{namedProvider("p", "A", "openai", 0), model("m", "p")}, nil)
+	// p is deleted and q takes its display_name.
+	out := assemble(t, v, []Source{namedProvider("q", "A", "caller", time.Hour), model("m", "p")}, &first)
+	wantState(t, out, v1alpha1.KindProviderKey, "q", Applied, "")
+	wantState(t, out, v1alpha1.KindModel, "m", Rejected, `ProviderKey "p", which does not exist`)
+	if _, ok := entries(t, out, "models")["m"]; ok {
+		t.Errorf("m is still served:\n%s", out.Document)
+	}
+}
+
+func TestModelIsRejectedWithItsProviderKey(t *testing.T) {
+	v := &fakeValidator{}
+	first := assemble(t, v, []Source{namedProvider("p", "A", "openai", 0), model("m", "p")}, nil)
+	// The gateway now refuses p's spec and its served entry.
+	v.reject = func(k v1alpha1.Kind, _ Entry) string {
+		if k == v1alpha1.KindProviderKey {
+			return "refused"
+		}
+		return ""
+	}
+	out := assemble(t, v, []Source{namedProvider("p", "A", "openai", 0), model("m", "p")}, &first)
+	wantState(t, out, v1alpha1.KindProviderKey, "p", Rejected, "refused")
+	wantState(t, out, v1alpha1.KindModel, "m", Rejected, `ProviderKey "p", which is not served`)
+	wantState(t, out, v1alpha1.KindModel, "m", Rejected, "refused")
+	if _, ok := entries(t, out, "models")["m"]; ok {
+		t.Errorf("m is still served:\n%s", out.Document)
+	}
+}
+
+func TestDollarsInAProviderDisplayNameStayEscaped(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{reject: rejectUnknownField})
+	first := assemble(t, v, []Source{namedProvider("p", "a$b", "openai", 0), model("m", "p")}, nil)
+	wantModel(t, first, "m", "a$$b", credOne)
+	out := assemble(t, v, []Source{namedProvider("p", "a$b", "openai", 0), invalid(model("m", "p"))}, &first)
+	wantState(t, out, v1alpha1.KindModel, "m", Retained, "no_such_field")
+	wantModel(t, out, "m", "a$$b", credOne)
 }

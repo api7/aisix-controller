@@ -16,6 +16,9 @@ import (
 // FormatVersion is the resources-file format the controller writes.
 const FormatVersion = "1"
 
+// providerKeyField is how a Model entry names its ProviderKey's display_name.
+const providerKeyField = "provider_key"
+
 // Disposition is what happened to one custom resource.
 type Disposition struct {
 	State  State
@@ -99,12 +102,14 @@ type servedKey struct {
 type Served struct {
 	entries map[servedKey]Entry
 	owners  map[Key]string
+	// providers maps a served ProviderKey display_name to its metadata.name.
+	providers map[string]string
 }
 
 // ServedEntries parses a served document and its index. Anything unreadable
 // counts as nothing served.
 func ServedEntries(document, index []byte) Served {
-	out := Served{entries: map[servedKey]Entry{}, owners: map[Key]string{}}
+	out := Served{entries: map[servedKey]Entry{}, owners: map[Key]string{}, providers: map[string]string{}}
 	if len(document) == 0 || len(index) == 0 {
 		return out
 	}
@@ -126,7 +131,7 @@ func ServedEntries(document, index []byte) Served {
 				continue
 			}
 			if id, ok := e[v1alpha1.IdentityField].(string); ok {
-				out.entries[servedKey{k, strings.ReplaceAll(id, "$$", "$")}] = e
+				out.entries[servedKey{k, unescapeDollars(id)}] = e
 			}
 		}
 	}
@@ -136,9 +141,14 @@ func ServedEntries(document, index []byte) Served {
 			continue
 		}
 		out.owners[Key{v1alpha1.Kind(kind), name}] = id
+		if v1alpha1.Kind(kind) == v1alpha1.KindProviderKey {
+			out.providers[id] = name
+		}
 	}
 	return out
 }
+
+func unescapeDollars(s string) string { return strings.ReplaceAll(s, "$$", "$") }
 
 // get returns the entry a resource is served with, and its identity.
 func (s Served) get(src Source) (Entry, string, bool) {
@@ -177,7 +187,131 @@ type item struct {
 	entry  Entry
 	// identity the entry is served under.
 	identity string
-	reason   string
+	// providerRef is the metadata.name of the ProviderKey the entry uses.
+	providerRef string
+	reason      string
+}
+
+// assembly is the working state of one Assemble call.
+type assembly struct {
+	items  []*item
+	served Served
+	// providers finds ProviderKey items by metadata.name.
+	providers map[string]*item
+}
+
+// fallback replaces an item with its served entry, or rejects it when it
+// has none.
+func (a *assembly) fallback(it *item, reason string) {
+	it.reason = reason
+	e, id, ok := a.served.get(it.source)
+	if !ok {
+		it.state, it.entry, it.identity, it.providerRef = Rejected, nil, "", ""
+		return
+	}
+	it.state, it.entry, it.identity, it.providerRef = Retained, e, id, ""
+	if it.source.Kind != v1alpha1.KindModel {
+		return
+	}
+	name, ok := e[providerKeyField].(string)
+	if !ok {
+		return
+	}
+	owner, ok := a.served.providers[unescapeDollars(name)]
+	if !ok {
+		a.drop(it, fmt.Sprintf("no ProviderKey owns %s %q", providerKeyField, unescapeDollars(name)))
+		return
+	}
+	it.providerRef = owner
+}
+
+// drop rejects a Retained item.
+func (a *assembly) drop(it *item, reason string) {
+	it.state, it.entry, it.identity, it.providerRef = Rejected, nil, "", ""
+	it.reason += "; the previously served version is no longer valid either: " + reason
+}
+
+// holds reports whether an item is already served under its identity.
+func (a *assembly) holds(it *item) bool {
+	_, id, ok := a.served.get(it.source)
+	return ok && id == it.identity
+}
+
+// claim gives each identity to one item: the one served under it, else the
+// oldest, which comes first in file order.
+func (a *assembly) claim() bool {
+	winners := map[servedKey]*item{}
+	for _, it := range a.items {
+		if it.state == Rejected {
+			continue
+		}
+		k := servedKey{it.source.Kind, it.identity}
+		if w, ok := winners[k]; !ok || (a.holds(it) && !a.holds(w)) {
+			winners[k] = it
+		}
+	}
+	changed := false
+	for _, it := range a.items {
+		if it.state != Applied {
+			continue
+		}
+		if w := winners[servedKey{it.source.Kind, it.identity}]; w != it {
+			a.fallback(it, fmt.Sprintf("%s %q is already used by %s/%s", v1alpha1.IdentityField, it.identity, w.source.Kind, w.source.Name))
+			changed = true
+		}
+	}
+	return changed
+}
+
+// resolve points each Model at the display_name its ProviderKey is served
+// under now.
+func (a *assembly) resolve() bool {
+	changed := false
+	for _, it := range a.items {
+		if it.state == Rejected || it.providerRef == "" {
+			continue
+		}
+		var problem string
+		p := a.providers[it.providerRef]
+		switch {
+		case p == nil:
+			problem = fmt.Sprintf("%s names ProviderKey %q, which does not exist", v1alpha1.ProviderKeyRef, it.providerRef)
+		case p.state == Rejected:
+			problem = fmt.Sprintf("%s names ProviderKey %q, which is not served: %s", v1alpha1.ProviderKeyRef, it.providerRef, p.reason)
+		default:
+			it.setProviderKey(p.identity)
+			continue
+		}
+		if it.state == Applied {
+			a.fallback(it, problem)
+		} else {
+			a.drop(it, problem)
+		}
+		changed = true
+	}
+	return changed
+}
+
+// setProviderKey copies the entry, since a Retained one is shared with Served.
+func (it *item) setProviderKey(identity string) {
+	e := make(Entry, len(it.entry)+1)
+	for k, v := range it.entry {
+		e[k] = v
+	}
+	e[providerKeyField] = EscapeDollars(identity)
+	it.entry = e
+}
+
+// settle runs until no state changes: a fallback can bring back an identity
+// another item claims.
+func (a *assembly) settle() {
+	for {
+		claimed := a.claim()
+		resolved := a.resolve()
+		if !claimed && !resolved {
+			return
+		}
+	}
 }
 
 // Assemble builds the document to serve. An entry the gateway rejects is
@@ -185,23 +319,21 @@ type item struct {
 // the others down. With no served version it is left out.
 func Assemble(ctx context.Context, rendered []Rendered, served Served, v validate.Validator) (Outcome, error) {
 	items := make([]*item, len(rendered))
-	fallback := func(it *item, reason string) {
-		if e, id, ok := served.get(it.source); ok {
-			it.state, it.entry, it.identity, it.reason = Retained, e, id, reason
-		} else {
-			it.state, it.entry, it.identity, it.reason = Rejected, nil, "", reason
-		}
-	}
+	a := &assembly{items: items, served: served, providers: map[string]*item{}}
 	for i, r := range rendered {
-		it := &item{source: r.Source, state: Applied, entry: r.Entry, identity: r.Source.Identity()}
+		it := &item{source: r.Source, state: Applied, entry: r.Entry, identity: r.Source.Identity(), providerRef: r.ProviderRef}
 		if r.Err != "" {
-			fallback(it, r.Err)
+			a.fallback(it, r.Err)
 		}
 		items[i] = it
+		if r.Source.Kind == v1alpha1.KindProviderKey {
+			a.providers[r.Source.Name] = it
+		}
 	}
 
 	// Each failing round drops or replaces at least one entry.
 	for round := 0; round < 2*len(items)+1; round++ {
+		a.settle()
 		entries := map[v1alpha1.Kind][]Entry{}
 		positions := map[servedKey]*item{}
 		for _, it := range items {
@@ -242,10 +374,9 @@ func Assemble(ctx context.Context, rendered []Rendered, served Served, v validat
 			reason := strings.Join(faults[it], "; ")
 			switch it.state {
 			case Applied:
-				fallback(it, reason)
+				a.fallback(it, reason)
 			case Retained:
-				it.state, it.entry, it.identity = Rejected, nil, ""
-				it.reason = it.reason + "; the previously served version is no longer valid either: " + reason
+				a.drop(it, reason)
 			}
 		}
 	}

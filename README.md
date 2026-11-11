@@ -31,7 +31,7 @@ All kinds are namespaced, in `aisix.api7.ai/v1alpha1`. A `spec` is the AISIX res
 | `Model` | `aimodel` | `provider_key_ref: {name}`: a ProviderKey's `metadata.name` (direct models only) |
 | `APIKey` | `aikey` | `key_secret_ref: {name, key}`: the caller's plaintext key; only its SHA-256 is written |
 
-Secret refs may name any Secret in the namespace except the controller's own `aisix-resources`. A `provider_key_ref` must name a ProviderKey that is served; one that lost a shared `display_name` to an older ProviderKey is rejected.
+Secret refs may name any Secret in the namespace except the controller's own `aisix-resources`. A `provider_key_ref` must name a ProviderKey that is served, and resolves to the `display_name` that ProviderKey is actually served under. A resource already served under a `display_name` keeps it, so another resource claiming it is refused; when none is served under it, the oldest wins.
 
 ```yaml
 apiVersion: aisix.api7.ai/v1alpha1

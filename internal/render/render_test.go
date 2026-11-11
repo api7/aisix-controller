@@ -56,12 +56,8 @@ func TestProviderKeyTakesCredentialFromSecretAndEscapesIt(t *testing.T) {
 	}
 }
 
-func TestModelReferenceResolvesToProviderIdentity(t *testing.T) {
+func TestModelReferenceIsLeftForAssemble(t *testing.T) {
 	out := byKey(All([]Source{
-		src(v1alpha1.KindProviderKey, "pk", map[string]any{
-			v1alpha1.IdentityField:   "Provider One",
-			v1alpha1.APIKeySecretRef: ref("creds", "openai"),
-		}),
 		src(v1alpha1.KindModel, "m", map[string]any{
 			v1alpha1.IdentityField:  "openai/gpt",
 			v1alpha1.ProviderKeyRef: map[string]any{"name": "pk"},
@@ -71,8 +67,13 @@ func TestModelReferenceResolvesToProviderIdentity(t *testing.T) {
 	if m.Err != "" {
 		t.Fatal(m.Err)
 	}
-	if m.Entry["provider_key"] != "Provider One" || m.Entry[v1alpha1.IdentityField] != "openai/gpt" {
-		t.Errorf("entry = %v", m.Entry)
+	if m.ProviderRef != "pk" {
+		t.Errorf("ProviderRef = %q", m.ProviderRef)
+	}
+	for _, f := range []string{"provider_key", v1alpha1.ProviderKeyRef} {
+		if _, ok := m.Entry[f]; ok {
+			t.Errorf("%s is in the entry: %v", f, m.Entry)
+		}
 	}
 }
 
@@ -102,7 +103,7 @@ func TestMissingReferencesAreErrors(t *testing.T) {
 		src(v1alpha1.KindProviderKey, "no-key", map[string]any{v1alpha1.APIKeySecretRef: ref("creds", "nope")}),
 		src(v1alpha1.KindProviderKey, "empty", map[string]any{v1alpha1.APIKeySecretRef: ref("creds", "empty")}),
 		src(v1alpha1.KindProviderKey, "unset", map[string]any{}),
-		src(v1alpha1.KindModel, "dangling", map[string]any{v1alpha1.ProviderKeyRef: map[string]any{"name": "ghost"}}),
+		src(v1alpha1.KindModel, "nameless", map[string]any{v1alpha1.ProviderKeyRef: map[string]any{}}),
 		src(v1alpha1.KindAPIKey, "keyless", map[string]any{}),
 	}, testSecrets(), ""))
 	want := map[string]string{
@@ -110,7 +111,7 @@ func TestMissingReferencesAreErrors(t *testing.T) {
 		"ProviderKey/no-key":    `has no key "nope"`,
 		"ProviderKey/empty":     "is empty",
 		"ProviderKey/unset":     "api_key_secret_ref is required",
-		"Model/dangling":        `ProviderKey "ghost", which does not exist`,
+		"Model/nameless":        "provider_key_ref.name is required",
 		"APIKey/keyless":        "key_secret_ref is required",
 	}
 	for k, substr := range want {
@@ -131,19 +132,6 @@ func TestInlineCredentialsAreRefused(t *testing.T) {
 		if out[k].Err == "" {
 			t.Errorf("%s was accepted", k)
 		}
-	}
-}
-
-func TestDuplicateIdentityLosesToOlderResource(t *testing.T) {
-	older := src(v1alpha1.KindModel, "zzz", map[string]any{v1alpha1.IdentityField: "same"})
-	newer := src(v1alpha1.KindModel, "aaa", map[string]any{v1alpha1.IdentityField: "same"})
-	newer.Created = t0.Add(time.Minute)
-	out := byKey(All([]Source{newer, older}, testSecrets(), ""))
-	if out["Model/zzz"].Err != "" {
-		t.Errorf("older lost: %s", out["Model/zzz"].Err)
-	}
-	if !strings.Contains(out["Model/aaa"].Err, "already used by Model/zzz") {
-		t.Errorf("newer: %q", out["Model/aaa"].Err)
 	}
 }
 
@@ -190,29 +178,5 @@ func TestReferencesToTheResourcesSecretAreRefused(t *testing.T) {
 	}
 	if out["APIKey/fine"].Err != "" {
 		t.Errorf("unrelated reference refused: %s", out["APIKey/fine"].Err)
-	}
-}
-
-func TestModelCannotReferenceALosingProviderKey(t *testing.T) {
-	prod := src(v1alpha1.KindProviderKey, "openai-prod", map[string]any{
-		v1alpha1.IdentityField: "openai", v1alpha1.APIKeySecretRef: ref("creds", "openai"),
-	})
-	test := src(v1alpha1.KindProviderKey, "openai-test", map[string]any{
-		v1alpha1.IdentityField: "openai", v1alpha1.APIKeySecretRef: ref("creds", "caller"),
-	})
-	test.Created = t0.Add(time.Minute)
-	out := byKey(All([]Source{
-		test, prod,
-		src(v1alpha1.KindModel, "cheap", map[string]any{v1alpha1.ProviderKeyRef: map[string]any{"name": "openai-test"}}),
-		src(v1alpha1.KindModel, "main", map[string]any{v1alpha1.ProviderKeyRef: map[string]any{"name": "openai-prod"}}),
-	}, testSecrets(), ""))
-
-	cheap := out["Model/cheap"]
-	if cheap.Entry != nil || !strings.Contains(cheap.Err, `ProviderKey "openai-test", which is not served`) ||
-		!strings.Contains(cheap.Err, "ProviderKey/openai-prod") {
-		t.Errorf("cheap: entry=%v err=%q", cheap.Entry, cheap.Err)
-	}
-	if m := out["Model/main"]; m.Err != "" || m.Entry["provider_key"] != "openai" {
-		t.Errorf("main: entry=%v err=%q", m.Entry, m.Err)
 	}
 }
