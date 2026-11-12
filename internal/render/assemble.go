@@ -187,9 +187,9 @@ type item struct {
 	entry  Entry
 	// identity the entry is served under.
 	identity string
-	// providerRef is the metadata.name of the ProviderKey the entry uses.
-	providerRef string
-	reason      string
+	// providerRefs are the ProviderKeys the entry uses.
+	providerRefs []ProviderRef
+	reason       string
 }
 
 // assembly is the working state of one Assemble call.
@@ -206,28 +206,30 @@ func (a *assembly) fallback(it *item, reason string) {
 	it.reason = reason
 	e, id, ok := a.served.get(it.source)
 	if !ok {
-		it.state, it.entry, it.identity, it.providerRef = Rejected, nil, "", ""
+		it.state, it.entry, it.identity, it.providerRefs = Rejected, nil, "", nil
 		return
 	}
-	it.state, it.entry, it.identity, it.providerRef = Retained, e, id, ""
+	it.state, it.entry, it.identity, it.providerRefs = Retained, e, id, nil
 	if it.source.Kind != v1alpha1.KindModel {
 		return
 	}
-	name, ok := e[providerKeyField].(string)
-	if !ok {
-		return
+	for _, path := range v1alpha1.ProviderKeyRefPaths {
+		name, ok := objectAt(e, path)[providerKeyField].(string)
+		if !ok {
+			continue
+		}
+		owner, ok := a.served.providers[unescapeDollars(name)]
+		if !ok {
+			a.drop(it, fmt.Sprintf("no ProviderKey owns %s %q", fieldAt(path, providerKeyField), unescapeDollars(name)))
+			return
+		}
+		it.providerRefs = append(it.providerRefs, ProviderRef{Path: path, Name: owner})
 	}
-	owner, ok := a.served.providers[unescapeDollars(name)]
-	if !ok {
-		a.drop(it, fmt.Sprintf("no ProviderKey owns %s %q", providerKeyField, unescapeDollars(name)))
-		return
-	}
-	it.providerRef = owner
 }
 
 // drop rejects a Retained item.
 func (a *assembly) drop(it *item, reason string) {
-	it.state, it.entry, it.identity, it.providerRef = Rejected, nil, "", ""
+	it.state, it.entry, it.identity, it.providerRefs = Rejected, nil, "", nil
 	it.reason += "; the previously served version is no longer valid either: " + reason
 }
 
@@ -263,23 +265,16 @@ func (a *assembly) claim() bool {
 	return changed
 }
 
-// resolve points each Model at the display_name its ProviderKey is served
-// under now.
+// resolve points each Model at the display_names its ProviderKeys are
+// served under now.
 func (a *assembly) resolve() bool {
 	changed := false
 	for _, it := range a.items {
-		if it.state == Rejected || it.providerRef == "" {
+		if it.state == Rejected {
 			continue
 		}
-		var problem string
-		p := a.providers[it.providerRef]
-		switch {
-		case p == nil:
-			problem = fmt.Sprintf("%s names ProviderKey %q, which does not exist", v1alpha1.ProviderKeyRef, it.providerRef)
-		case p.state == Rejected:
-			problem = fmt.Sprintf("%s names ProviderKey %q, which is not served: %s", v1alpha1.ProviderKeyRef, it.providerRef, p.reason)
-		default:
-			it.setProviderKey(p.identity)
+		problem := a.bind(it)
+		if problem == "" {
 			continue
 		}
 		if it.state == Applied {
@@ -292,13 +287,29 @@ func (a *assembly) resolve() bool {
 	return changed
 }
 
-// setProviderKey copies the entry, since a Retained one is shared with Served.
-func (it *item) setProviderKey(identity string) {
-	e := make(Entry, len(it.entry)+1)
-	for k, v := range it.entry {
-		e[k] = v
+// bind writes each ref's served display_name into the entry, or says why
+// one has none.
+func (a *assembly) bind(it *item) string {
+	for _, r := range it.providerRefs {
+		p := a.providers[r.Name]
+		switch {
+		case p == nil:
+			return fmt.Sprintf("%s names ProviderKey %q, which does not exist", r.Field(), r.Name)
+		case p.state == Rejected:
+			return fmt.Sprintf("%s names ProviderKey %q, which is not served: %s", r.Field(), r.Name, p.reason)
+		}
+		it.setProviderKey(r.Path, p.identity)
 	}
-	e[providerKeyField] = EscapeDollars(identity)
+	return ""
+}
+
+// setProviderKey copies the entry, since a Retained one is shared with Served.
+func (it *item) setProviderKey(path []string, identity string) {
+	e, m := clonePath(it.entry, path)
+	if m == nil {
+		return
+	}
+	m[providerKeyField] = EscapeDollars(identity)
 	it.entry = e
 }
 
@@ -321,7 +332,7 @@ func Assemble(ctx context.Context, rendered []Rendered, served Served, v validat
 	items := make([]*item, len(rendered))
 	a := &assembly{items: items, served: served, providers: map[string]*item{}}
 	for i, r := range rendered {
-		it := &item{source: r.Source, state: Applied, entry: r.Entry, identity: r.Source.Identity(), providerRef: r.ProviderRef}
+		it := &item{source: r.Source, state: Applied, entry: r.Entry, identity: r.Source.Identity(), providerRefs: r.ProviderRefs}
 		if r.Err != "" {
 			a.fallback(it, r.Err)
 		}

@@ -41,8 +41,10 @@ func (f *fakeValidator) Validate(_ context.Context, doc []byte) ([]validate.Load
 	for _, k := range v1alpha1.Kinds {
 		for i, e := range list(root, k.Collection()) {
 			scope := fmt.Sprintf("%s[%d] (%q)", k.Collection(), i, e[v1alpha1.IdentityField])
-			if name, ok := e["provider_key"].(string); ok && !providers[name] {
-				errs = append(errs, validate.LoadError{Scope: scope, Message: fmt.Sprintf("`provider_key` references unknown provider key %q", name)})
+			for _, path := range v1alpha1.ProviderKeyRefPaths {
+				if name, ok := objectAt(e, path)["provider_key"].(string); ok && !providers[name] {
+					errs = append(errs, validate.LoadError{Scope: scope, Message: fmt.Sprintf("`%s` references unknown provider key %q", fieldAt(path, "provider_key"), name)})
+				}
 			}
 			if f.reject != nil {
 				if msg := f.reject(k, e); msg != "" {
@@ -572,6 +574,77 @@ func TestModelIsRejectedWithItsProviderKey(t *testing.T) {
 	wantState(t, out, v1alpha1.KindModel, "m", Rejected, "refused")
 	if _, ok := entries(t, out, "models")["m"]; ok {
 		t.Errorf("m is still served:\n%s", out.Document)
+	}
+}
+
+// typesafe is a ProviderKey for a classifier's decision calls.
+func typesafe(name, display string) Source {
+	return src(v1alpha1.KindProviderKey, name, map[string]any{
+		"provider": "typesafe", v1alpha1.IdentityField: display,
+		v1alpha1.APIKeySecretRef: ref("creds", "caller"),
+	})
+}
+
+// router is a semantic router whose classifier uses providerRef.
+func router(name, providerRef string) Source {
+	return src(v1alpha1.KindModel, name, map[string]any{
+		"semantic": map[string]any{
+			"classifier": map[string]any{
+				"type":                  "jev",
+				v1alpha1.ProviderKeyRef: map[string]any{"name": providerRef},
+			},
+			"default": "chat",
+			"routes": []any{map[string]any{
+				"name": "billing", "target": "chat", "description": "billing questions",
+			}},
+		},
+	})
+}
+
+// wantClassifier checks which provider key a router's classifier is served on.
+func wantClassifier(t *testing.T, o Outcome, model, providerKey string) {
+	t.Helper()
+	m, ok := entries(t, o, "models")[model]
+	if !ok {
+		t.Fatalf("model %s is not served:\n%s", model, o.Document)
+	}
+	if got := objectAt(m, v1alpha1.ProviderKeyRefPaths[1])["provider_key"]; got != providerKey {
+		t.Errorf("model %s: classifier provider_key = %v, want %s", model, got, providerKey)
+	}
+}
+
+func TestClassifierResolvesToTheProviderDisplayName(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	out := assemble(t, v, []Source{provider(), typesafe("ts", "TypeSafe Key"), model("chat", "mock"), router("router", "ts")}, nil)
+	wantState(t, out, v1alpha1.KindModel, "router", Applied, "")
+	wantClassifier(t, out, "router", "TypeSafe Key")
+}
+
+func TestClassifierNamingAMissingProviderKeyIsRejected(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{})
+	out := assemble(t, v, []Source{provider(), model("chat", "mock"), router("router", "ghost")}, nil)
+	wantState(t, out, v1alpha1.KindModel, "router", Rejected, `semantic.classifier.provider_key_ref names ProviderKey "ghost", which does not exist`)
+	wantState(t, out, v1alpha1.KindModel, "chat", Applied, "")
+}
+
+func TestRetainedClassifierFollowsItsProviderKeyRename(t *testing.T) {
+	v := gatewayValidator(t, &fakeValidator{reject: rejectUnknownField})
+	first := assemble(t, v, []Source{provider(), typesafe("ts", "A"), model("chat", "mock"), router("router", "ts")}, nil)
+	out := assemble(t, v, []Source{provider(), typesafe("ts", "B"), model("chat", "mock"), invalid(router("router", "ts"))}, &first)
+	wantState(t, out, v1alpha1.KindProviderKey, "ts", Applied, "")
+	wantState(t, out, v1alpha1.KindModel, "router", Retained, "no_such_field")
+	wantClassifier(t, out, "router", "B")
+}
+
+func TestRetainedClassifierIsRejectedWithItsProviderKey(t *testing.T) {
+	v := &fakeValidator{}
+	first := assemble(t, v, []Source{provider(), typesafe("ts", "A"), model("chat", "mock"), router("router", "ts")}, nil)
+	// ts is deleted, and the router's new spec names it.
+	out := assemble(t, v, []Source{provider(), model("chat", "mock"), router("router", "ts")}, &first)
+	wantState(t, out, v1alpha1.KindModel, "router", Rejected, `semantic.classifier.provider_key_ref names ProviderKey "ts", which does not exist`)
+	wantState(t, out, v1alpha1.KindModel, "router", Rejected, "the previously served version is no longer valid either")
+	if _, ok := entries(t, out, "models")["router"]; ok {
+		t.Errorf("router is still served:\n%s", out.Document)
 	}
 }
 

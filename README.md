@@ -28,7 +28,7 @@ All kinds are namespaced, in `aisix.api7.ai/v1alpha1`. A `spec` is the AISIX res
 | Kind | Short name | Reference fields |
 |---|---|---|
 | `ProviderKey` | `aipk` | `api_key_secret_ref: {name, key}`: the upstream credential |
-| `Model` | `aimodel` | `provider_key_ref: {name}`: a ProviderKey's `metadata.name` (direct models only) |
+| `Model` | `aimodel` | `provider_key_ref: {name}`: a ProviderKey's `metadata.name`, on direct models and under a semantic router's `semantic.classifier` |
 | `APIKey` | `aikey` | `key_secret_ref: {name, key}`: the caller's plaintext key; only its SHA-256 is written |
 
 Secret refs may name any Secret in the namespace except the controller's own `aisix-resources`. A `provider_key_ref` must name a ProviderKey that is served, and resolves to the `display_name` that ProviderKey is actually served under. A resource already served under a `display_name` keeps it, so another resource claiming it is refused; when none is served under it, the oldest wins.

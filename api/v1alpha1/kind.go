@@ -105,3 +105,8 @@ const (
 	// HashAnnotation carries the served resources-file hash.
 	HashAnnotation = "aisix.api7.ai/resources-hash"
 )
+
+// ProviderKeyRefPaths are the objects in a Model spec that hold a
+// ProviderKeyRef: the root, for direct models, and a semantic router's
+// classifier.
+var ProviderKeyRefPaths = [][]string{nil, {"semantic", "classifier"}}

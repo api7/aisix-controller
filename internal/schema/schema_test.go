@@ -159,6 +159,22 @@ func TestIDFormReferencesAreRemoved(t *testing.T) {
 	}
 }
 
+func TestClassifierHasAProviderKeyRef(t *testing.T) {
+	classifier := specSchema(t, v1alpha1.KindModel)
+	for _, p := range v1alpha1.ProviderKeyRefPaths[1] {
+		classifier = classifier["properties"].(obj)[p].(obj)
+	}
+	if _, ok := classifier["properties"].(obj)[v1alpha1.ProviderKeyRef]; !ok {
+		t.Fatalf("classifier lacks %s", v1alpha1.ProviderKeyRef)
+	}
+	if !has(required(classifier), v1alpha1.ProviderKeyRef) {
+		t.Errorf("classifier does not require %s", v1alpha1.ProviderKeyRef)
+	}
+	if has(required(specSchema(t, v1alpha1.KindModel)), v1alpha1.ProviderKeyRef) {
+		t.Errorf("Model requires a root %s", v1alpha1.ProviderKeyRef)
+	}
+}
+
 func TestIdentityIsOptional(t *testing.T) {
 	for _, k := range v1alpha1.Kinds {
 		s := specSchema(t, k)
