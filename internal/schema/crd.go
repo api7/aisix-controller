@@ -56,9 +56,28 @@ func secretKeyRef(description string) obj {
 }
 
 type addedField struct {
+	// at is the object the field is added to; empty for the spec root.
+	at       []string
 	name     string
 	schema   obj
 	required bool
+}
+
+func providerKeyRef(description string) obj {
+	return obj{
+		"type":        "object",
+		"description": description,
+		"required":    []any{"name"},
+		"properties": obj{
+			"name": obj{"type": "string", "minLength": 1, "description": "ProviderKey `metadata.name`."},
+		},
+	}
+}
+
+// providerKeyRefDescriptions match v1alpha1.ProviderKeyRefPaths.
+var providerKeyRefDescriptions = []string{
+	"ProviderKey, in the same namespace, this model authenticates with. Direct models need it; routing, ensemble and semantic models leave it unset. A semantic router's classifier sets its own under `semantic.classifier`.",
+	"ProviderKey, in the same namespace, that authenticates the classifier's decision calls. Its `provider` must be `typesafe`.",
 }
 
 // addedFields are the reference fields the controller resolves.
@@ -66,31 +85,52 @@ func addedFields(k v1alpha1.Kind) []addedField {
 	switch k {
 	case v1alpha1.KindProviderKey:
 		return []addedField{{
+			nil,
 			v1alpha1.APIKeySecretRef,
 			secretKeyRef("Secret key holding the upstream provider credential. The controller writes it as `api_key`."),
 			true,
 		}}
 	case v1alpha1.KindModel:
-		return []addedField{{
-			v1alpha1.ProviderKeyRef,
-			obj{
-				"type":        "object",
-				"description": "ProviderKey, in the same namespace, this model authenticates with. Direct models need it; routing, ensemble and semantic models leave it unset.",
-				"required":    []any{"name"},
-				"properties": obj{
-					"name": obj{"type": "string", "minLength": 1, "description": "ProviderKey `metadata.name`."},
-				},
-			},
-			false,
-		}}
+		var out []addedField
+		for i, at := range v1alpha1.ProviderKeyRefPaths {
+			// Only a nested ref is required: its object always needs a key.
+			out = append(out, addedField{at, v1alpha1.ProviderKeyRef, providerKeyRef(providerKeyRefDescriptions[i]), len(at) > 0})
+		}
+		return out
 	case v1alpha1.KindAPIKey:
 		return []addedField{{
+			nil,
 			v1alpha1.KeySecretRef,
 			secretKeyRef("Secret key holding the caller's plaintext API key. The controller writes only its SHA-256 hash."),
 			true,
 		}}
 	}
 	return nil
+}
+
+// addFields adds a kind's reference fields to its structural spec schema.
+func addFields(k v1alpha1.Kind, spec obj) {
+	for _, f := range addedFields(k) {
+		node := spec
+		for _, p := range f.at {
+			props, _ := node["properties"].(obj)
+			next, ok := props[p].(obj)
+			if !ok {
+				panic(fmt.Sprintf("%s: no object at %s for %s", k, strings.Join(f.at, "."), f.name))
+			}
+			node = next
+		}
+		props, _ := node["properties"].(obj)
+		if props == nil {
+			props = obj{}
+			node["properties"] = props
+		}
+		props[f.name] = f.schema
+		if f.required {
+			required, _ := node["required"].([]any)
+			node["required"] = append(required, f.name)
+		}
+	}
 }
 
 // LoadSchema reads a vendored AISIX schema.
@@ -128,19 +168,9 @@ func Shape(k v1alpha1.Kind, root obj) obj {
 		}
 	}
 	props, _ := root["properties"].(obj)
-	if props == nil {
-		props = obj{}
-		root["properties"] = props
-	}
 	if identity, ok := props[v1alpha1.IdentityField].(obj); ok {
 		base, _ := identity["description"].(string)
 		identity["description"] = strings.TrimSpace(base + " Defaults to `metadata.name`.")
-	}
-	for _, f := range addedFields(k) {
-		props[f.name] = f.schema
-		if f.required {
-			required = append(required, f.name)
-		}
 	}
 	if len(required) == 0 {
 		delete(root, "required")
@@ -225,6 +255,8 @@ func statusSchema() obj {
 
 // ResourceSchema is the full structural schema of a kind's custom resource.
 func ResourceSchema(k v1alpha1.Kind, aisixSchema obj) obj {
+	spec := ToStructural(Shape(k, aisixSchema))
+	addFields(k, spec)
 	return obj{
 		"type":        "object",
 		"description": fmt.Sprintf("AISIX %s resource.", k),
@@ -233,7 +265,7 @@ func ResourceSchema(k v1alpha1.Kind, aisixSchema obj) obj {
 			"apiVersion": obj{"type": "string"},
 			"kind":       obj{"type": "string"},
 			"metadata":   obj{"type": "object"},
-			"spec":       ToStructural(Shape(k, aisixSchema)),
+			"spec":       spec,
 			"status":     statusSchema(),
 		},
 	}

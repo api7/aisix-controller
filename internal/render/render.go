@@ -55,10 +55,60 @@ type Entry = map[string]any
 type Rendered struct {
 	Source Source
 	Entry  Entry
-	// ProviderRef is the metadata.name a Model references. Assemble resolves
-	// it to the display_name that ProviderKey ends up served under.
-	ProviderRef string
-	Err         string
+	// ProviderRefs are the ProviderKeys a Model references. Assemble
+	// resolves each to the display_name that ProviderKey ends up served under.
+	ProviderRefs []ProviderRef
+	Err          string
+}
+
+// ProviderRef is one ProviderKeyRef in a Model spec.
+type ProviderRef struct {
+	// Path is the object holding the ref, one of v1alpha1.ProviderKeyRefPaths.
+	Path []string
+	// Name is the ProviderKey's metadata.name.
+	Name string
+}
+
+// Field is the ref's spec path, for messages.
+func (r ProviderRef) Field() string { return fieldAt(r.Path, v1alpha1.ProviderKeyRef) }
+
+func fieldAt(path []string, field string) string {
+	return strings.Join(append(append([]string(nil), path...), field), ".")
+}
+
+// objectAt returns the object at path in m, or nil.
+func objectAt(m map[string]any, path []string) map[string]any {
+	for _, p := range path {
+		next, ok := m[p].(map[string]any)
+		if !ok {
+			return nil
+		}
+		m = next
+	}
+	return m
+}
+
+// clonePath copies e and every object along path, so the object at path
+// can change without touching e. That object is nil when path leads to none.
+func clonePath(e Entry, path []string) (Entry, map[string]any) {
+	out := make(Entry, len(e)+1)
+	for k, v := range e {
+		out[k] = v
+	}
+	m := out
+	for _, p := range path {
+		next, ok := m[p].(map[string]any)
+		if !ok {
+			return out, nil
+		}
+		c := make(map[string]any, len(next)+1)
+		for k, v := range next {
+			c[k] = v
+		}
+		m[p] = c
+		m = c
+	}
+	return out, m
 }
 
 // sortSources orders sources the way the file lists them: by kind, then
@@ -87,19 +137,19 @@ func All(sources []Source, secrets Secrets, reserved string) []Rendered {
 	out := make([]Rendered, 0, len(ordered))
 	for _, s := range ordered {
 		r := Rendered{Source: s}
-		entry, providerRef, err := one(s, secrets, reserved)
+		entry, providerRefs, err := one(s, secrets, reserved)
 		if err != nil {
 			r.Err = err.Error()
 		} else {
-			r.Entry, r.ProviderRef = entry, providerRef
+			r.Entry, r.ProviderRefs = entry, providerRefs
 		}
 		out = append(out, r)
 	}
 	return out
 }
 
-func one(s Source, secrets Secrets, reserved string) (Entry, string, error) {
-	var providerRef string
+func one(s Source, secrets Secrets, reserved string) (Entry, []ProviderRef, error) {
+	var providerRefs []ProviderRef
 	fields := make(Entry, len(s.Fields)+1)
 	for k, v := range s.Fields {
 		fields[k] = v
@@ -110,48 +160,59 @@ func one(s Source, secrets Secrets, reserved string) (Entry, string, error) {
 	case v1alpha1.KindProviderKey:
 		for _, inline := range []string{"api_key", "secret"} {
 			if _, ok := fields[inline]; ok {
-				return nil, "", fmt.Errorf("set the credential through %s, not `%s`", v1alpha1.APIKeySecretRef, inline)
+				return nil, nil, fmt.Errorf("set the credential through %s, not `%s`", v1alpha1.APIKeySecretRef, inline)
 			}
 		}
 		ref, ok := fields[v1alpha1.APIKeySecretRef]
 		if !ok {
-			return nil, "", fmt.Errorf("%s is required", v1alpha1.APIKeySecretRef)
+			return nil, nil, fmt.Errorf("%s is required", v1alpha1.APIKeySecretRef)
 		}
 		delete(fields, v1alpha1.APIKeySecretRef)
 		value, err := secretValue(ref, secrets, reserved, v1alpha1.APIKeySecretRef)
 		if err != nil {
-			return nil, "", err
+			return nil, nil, err
 		}
 		fields["api_key"] = value
 	case v1alpha1.KindModel:
-		if _, ok := fields["provider_key_id"]; ok {
-			return nil, "", fmt.Errorf("reference the provider key through %s", v1alpha1.ProviderKeyRef)
-		}
-		if ref, ok := fields[v1alpha1.ProviderKeyRef]; ok {
-			delete(fields, v1alpha1.ProviderKeyRef)
-			m, _ := ref.(map[string]any)
-			providerRef, _ = m["name"].(string)
-			if providerRef == "" {
-				return nil, "", fmt.Errorf("%s.name is required", v1alpha1.ProviderKeyRef)
+		for _, path := range v1alpha1.ProviderKeyRefPaths {
+			var m map[string]any
+			fields, m = clonePath(fields, path)
+			if m == nil {
+				continue
 			}
+			r := ProviderRef{Path: path}
+			if _, ok := m["provider_key_id"]; ok {
+				return nil, nil, fmt.Errorf("reference the provider key through %s", r.Field())
+			}
+			ref, ok := m[v1alpha1.ProviderKeyRef]
+			if !ok {
+				continue
+			}
+			delete(m, v1alpha1.ProviderKeyRef)
+			refObj, _ := ref.(map[string]any)
+			r.Name, _ = refObj["name"].(string)
+			if r.Name == "" {
+				return nil, nil, fmt.Errorf("%s.name is required", r.Field())
+			}
+			providerRefs = append(providerRefs, r)
 		}
 	case v1alpha1.KindAPIKey:
 		if _, ok := fields["key_hash"]; ok {
-			return nil, "", fmt.Errorf("set the key through %s, not `key_hash`", v1alpha1.KeySecretRef)
+			return nil, nil, fmt.Errorf("set the key through %s, not `key_hash`", v1alpha1.KeySecretRef)
 		}
 		ref, ok := fields[v1alpha1.KeySecretRef]
 		if !ok {
-			return nil, "", fmt.Errorf("%s is required", v1alpha1.KeySecretRef)
+			return nil, nil, fmt.Errorf("%s is required", v1alpha1.KeySecretRef)
 		}
 		delete(fields, v1alpha1.KeySecretRef)
 		plaintext, err := secretValue(ref, secrets, reserved, v1alpha1.KeySecretRef)
 		if err != nil {
-			return nil, "", err
+			return nil, nil, err
 		}
 		fields["key_hash"] = HashKey(plaintext)
 	}
 
-	return EscapeDollars(fields).(Entry), providerRef, nil
+	return EscapeDollars(fields).(Entry), providerRefs, nil
 }
 
 // HashKey is how the gateway stores a caller key: SHA-256, lowercase hex

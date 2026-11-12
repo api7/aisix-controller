@@ -303,7 +303,8 @@ spec:
               provider_key_ref:
                 description: ProviderKey, in the same namespace, this model authenticates
                   with. Direct models need it; routing, ensemble and semantic models
-                  leave it unset.
+                  leave it unset. A semantic router's classifier sets its own under
+                  `semantic.classifier`.
                 properties:
                   name:
                     description: ProviderKey `metadata.name`.
@@ -517,6 +518,18 @@ spec:
                           out, or returns an answer that names no route. Same values
                           as `on_embedding_failure`.
                         x-kubernetes-preserve-unknown-fields: true
+                      provider_key_ref:
+                        description: ProviderKey, in the same namespace, that authenticates
+                          the classifier's decision calls. Its `provider` must be
+                          `typesafe`.
+                        properties:
+                          name:
+                            description: ProviderKey `metadata.name`.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
                       timeout_ms:
                         description: Deadline for the decision call, in milliseconds.
                         minimum: 1
@@ -529,6 +542,7 @@ spec:
                         type: string
                     required:
                     - type
+                    - provider_key_ref
                     type: object
                   default:
                     description: Direct model alias used when no route clears its

@@ -67,12 +67,58 @@ func TestModelReferenceIsLeftForAssemble(t *testing.T) {
 	if m.Err != "" {
 		t.Fatal(m.Err)
 	}
-	if m.ProviderRef != "pk" {
-		t.Errorf("ProviderRef = %q", m.ProviderRef)
+	if len(m.ProviderRefs) != 1 || m.ProviderRefs[0].Name != "pk" || len(m.ProviderRefs[0].Path) != 0 {
+		t.Errorf("ProviderRefs = %+v", m.ProviderRefs)
 	}
 	for _, f := range []string{"provider_key", v1alpha1.ProviderKeyRef} {
 		if _, ok := m.Entry[f]; ok {
 			t.Errorf("%s is in the entry: %v", f, m.Entry)
+		}
+	}
+}
+
+func classifierSpec(ref map[string]any) map[string]any {
+	classifier := map[string]any{"type": "jev"}
+	if ref != nil {
+		classifier[v1alpha1.ProviderKeyRef] = ref
+	}
+	return map[string]any{"semantic": map[string]any{"classifier": classifier}}
+}
+
+func TestClassifierReferenceIsLeftForAssemble(t *testing.T) {
+	s := src(v1alpha1.KindModel, "router", classifierSpec(map[string]any{"name": "ts"}))
+	m := byKey(All([]Source{s}, testSecrets(), ""))["Model/router"]
+	if m.Err != "" {
+		t.Fatal(m.Err)
+	}
+	if len(m.ProviderRefs) != 1 || m.ProviderRefs[0].Name != "ts" || m.ProviderRefs[0].Field() != "semantic.classifier.provider_key_ref" {
+		t.Errorf("ProviderRefs = %+v", m.ProviderRefs)
+	}
+	classifier := m.Entry["semantic"].(map[string]any)["classifier"].(map[string]any)
+	for _, f := range []string{"provider_key", v1alpha1.ProviderKeyRef} {
+		if _, ok := classifier[f]; ok {
+			t.Errorf("%s is in the classifier: %v", f, classifier)
+		}
+	}
+	if _, ok := s.Fields["semantic"].(map[string]any)["classifier"].(map[string]any)[v1alpha1.ProviderKeyRef]; !ok {
+		t.Error("the source was mutated")
+	}
+}
+
+func TestClassifierReferenceErrors(t *testing.T) {
+	byID := classifierSpec(nil)
+	byID["semantic"].(map[string]any)["classifier"].(map[string]any)["provider_key_id"] = "x"
+	out := byKey(All([]Source{
+		src(v1alpha1.KindModel, "nameless", classifierSpec(map[string]any{})),
+		src(v1alpha1.KindModel, "by-id", byID),
+	}, testSecrets(), ""))
+	want := map[string]string{
+		"Model/nameless": "semantic.classifier.provider_key_ref.name is required",
+		"Model/by-id":    "reference the provider key through semantic.classifier.provider_key_ref",
+	}
+	for k, substr := range want {
+		if !strings.Contains(out[k].Err, substr) {
+			t.Errorf("%s: err %q lacks %q", k, out[k].Err, substr)
 		}
 	}
 }
